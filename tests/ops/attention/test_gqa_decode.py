@@ -5,9 +5,14 @@ import torch
 from tests.test_base import FixtureBase, TestBase
 from tileops.kernels.attention.gqa_decode import GQADecodeKernel
 from tileops.ops import GroupedQueryAttentionDecodeWithKVCacheFwdOp
+from tileops.utils import is_hopper
 from workloads.attention.gqa_decode import (
     GroupedQueryAttentionDecodeTest as _GroupedQueryAttentionDecodeTestWorkload,
 )
+
+# Qwen3-30B-A3B GQA decode shape (heads / heads_kv = 8) that selects the batch=1
+# warp-specialized decode kernels.
+_BS1_HEADS, _BS1_HEADS_KV, _BS1_DIM = 32, 4, 128
 
 
 class GroupedQueryAttentionDecodeTest(_GroupedQueryAttentionDecodeTestWorkload, TestBase):
@@ -115,6 +120,68 @@ def test_gqa_decode_rejects_non_divisible_heads() -> None:
 def test_gqa_decode_rejects_non_positive_seqlen_kv() -> None:
     with pytest.raises(ValueError, match="seqlen_kv must be positive"):
         GQADecodeKernel(1, 16, 2, 0, 128, dtype="float16")
+
+
+@pytest.mark.smoke
+def test_gqa_decode_bs1_dispatch() -> None:
+    """batch=1 fp16 dim-128 requests select the WS kernel; other dtypes/shapes fall back."""
+    if not is_hopper():
+        pytest.skip("batch=1 warp-specialized decode requires Hopper")
+    op = GroupedQueryAttentionDecodeWithKVCacheFwdOp(1, _BS1_HEADS, _BS1_HEADS_KV, 8192, _BS1_DIM,
+                                                     torch.float16)
+    assert op._uses_bs1_fast_path()
+    assert op.kernel.__class__.__name__ == "GQADecodeBs1Kernel"
+    assert op.kernel._select_tier(6000) == "ctx"
+    assert op.kernel._select_tier(1024) == "ctx"
+    assert op.kernel._select_tier(512) == "no_split"
+    # Slice count is the largest of {32, 16, 8} dividing the KV length (balanced slices).
+    assert op.kernel._ctx_splits_for(8192) == 32
+    assert op.kernel._ctx_splits_for(2048) == 16
+    assert op.kernel._ctx_splits_for(3072) == 8
+
+    # bfloat16 is unsupported by the fp16-only WS kernel -> generic decode kernel.
+    op_bf16 = GroupedQueryAttentionDecodeWithKVCacheFwdOp(1, _BS1_HEADS, _BS1_HEADS_KV, 4096,
+                                                          _BS1_DIM, torch.bfloat16)
+    assert not op_bf16._uses_bs1_fast_path()
+    assert op_bf16.kernel.__class__.__name__ == "GQADecodeKernel"
+
+    # batch != 1 keeps the generic decode kernel.
+    op_batched = GroupedQueryAttentionDecodeWithKVCacheFwdOp(4, _BS1_HEADS, _BS1_HEADS_KV, 4096,
+                                                             _BS1_DIM, torch.float16)
+    assert not op_batched._uses_bs1_fast_path()
+    assert op_batched.kernel.__class__.__name__ == "GQADecodeKernel"
+
+
+@pytest.mark.smoke
+def test_gqa_decode_bs1_runtime_context_switch() -> None:
+    """One op instance stays correct across the context range as the cache grows.
+
+    Covers the crossover (1024), a balanced mid split, an aligned split needing >=3 tiles
+    per slice, an unaligned length, and the sub-1024 non-split fallback.
+    """
+    if not is_hopper():
+        pytest.skip("batch=1 warp-specialized decode requires Hopper")
+    op = GroupedQueryAttentionDecodeWithKVCacheFwdOp(1, _BS1_HEADS, _BS1_HEADS_KV, 8192, _BS1_DIM,
+                                                     torch.float16)
+    assert op.kernel.__class__.__name__ == "GQADecodeBs1Kernel"
+    for real, tier in ((6000, "ctx"), (3072, "ctx"), (2048, "ctx"), (1024, "ctx"), (512,
+                                                                                     "no_split")):
+        assert op.kernel._select_tier(real) == tier
+        test = GroupedQueryAttentionDecodeTest(1, _BS1_HEADS, _BS1_HEADS_KV, real, _BS1_DIM,
+                                               torch.float16)
+        test.check(op, *test.gen_inputs(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.smoke
+def test_gqa_decode_bs1_group4() -> None:
+    """The WS kernel generalizes to a query-per-KV-head group other than 8 (here 4)."""
+    if not is_hopper():
+        pytest.skip("batch=1 warp-specialized decode requires Hopper")
+    op = GroupedQueryAttentionDecodeWithKVCacheFwdOp(1, 32, 8, 4096, _BS1_DIM, torch.float16)
+    assert op._uses_bs1_fast_path()
+    assert op.kernel.__class__.__name__ == "GQADecodeBs1Kernel"
+    test = GroupedQueryAttentionDecodeTest(1, 32, 8, 4096, _BS1_DIM, torch.float16)
+    test.check(op, *test.gen_inputs(), atol=1e-2, rtol=1e-2)
 
 
 if __name__ == "__main__":
